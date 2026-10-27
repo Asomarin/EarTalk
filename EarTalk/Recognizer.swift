@@ -121,6 +121,8 @@ final class Slot {
 final class Pair {
     let slots: [Slot]
     let start = Date()
+    var tainted = false      // our own speech was playing from the phone speaker
+    var peak = 0.0           // loudest level heard
     var onActivity: (() -> Void)?
 
     init() {
@@ -281,6 +283,7 @@ final class Recognizer: ObservableObject {
                         let rms = (sum / Float(max(n, 1))).squareRoot()
                         let lvl = Double(min(1, max(0, (20 * log10(max(rms, 1e-6)) + 50) / 50)))
                         if lvl > 0.3 { self.lastLoud = ProcessInfo.processInfo.systemUptime }
+                        if let p, lvl > p.peak { p.peak = lvl }
                         DispatchQueue.main.async {
                             self.bars.removeFirst()
                             self.bars.append(lvl)
@@ -328,6 +331,7 @@ final class Recognizer: ObservableObject {
 
     private func activity(_ p: Pair?) {
         guard let p, p === peek() else { return }
+        if speaker.muteAll() { p.tainted = true }
         let zh = p.slots.first { $0.lang == "zh" }?.text ?? ""
         let en = p.slots.first { $0.lang == "en" }?.text ?? ""
         live = hasHan(zh) ? zh : en
@@ -375,6 +379,9 @@ final class Recognizer: ObservableObject {
             lang = "en"
         }
         guard !lang.isEmpty else { return }
+        // Drop noise, echoes of our own voice, and stray single words.
+        if pair.tainted || pair.peak < 0.4 { return }
+        if lang == "en" && enWords < 2 && et.count < 4 { return }
         // Ignore our own spoken translation coming back through the microphone.
         if speaker.suppresses(lang) { return }
         let dbg = String(format: "zh %.2f (%d chars)  en %.2f", zc, han, ec)
