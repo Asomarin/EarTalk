@@ -7,6 +7,7 @@ struct Entry: Identifiable {
     let original: String
     let lang: String          // "zh" or "en"
     var translation: String?
+    var debug = ""
 }
 
 private func hasHan(_ s: String) -> Bool {
@@ -353,22 +354,30 @@ final class Recognizer: ObservableObject {
         if (hasText && (quiet || age > 12)) || age > 50 { endUtterance(p) }
     }
 
-    /// Pick the language whose recognizer understood the speech best.
+    /// Pick the language of the speech. Chinese text from the Chinese recognizer is a
+    /// strong signal (English speech normally comes back as Latin letters), and its
+    /// confidence numbers are unreliable, so confidence only overrules it when English
+    /// is clearly better.
     private func decide(_ pair: Pair) {
         pair.cancel()
-        let cands = pair.slots.map { s -> (Slot, Float) in
-            let t = s.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if t.isEmpty { return (s, -1) }
-            if s.lang == "zh" && !hasHan(t) { return (s, -1) }
-            if s.lang == "en" && hasHan(t) { return (s, -1) }
-            return (s, s.conf)
+        let zh = pair.slots.first { $0.lang == "zh" }
+        let en = pair.slots.first { $0.lang == "en" }
+        let zt = (zh?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let et = (en?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let han = zt.unicodeScalars.filter { (0x4E00...0x9FFF).contains($0.value) }.count
+        let zc = zh?.conf ?? 0, ec = en?.conf ?? 0
+        let enWords = et.split(separator: " ").count
+        var lang = ""
+        if han >= 2 {
+            let enMuchBetter = zc > 0.05 && ec - zc > 0.35 && enWords >= 4
+            lang = enMuchBetter ? "en" : "zh"
+        } else if !et.isEmpty && !hasHan(et) {
+            lang = "en"
         }
-        guard let best = cands.max(by: {
-            $0.1 < $1.1 || ($0.1 == $1.1 && $0.0.text.count < $1.0.text.count)
-        }), best.1 >= 0 else { return }
+        guard !lang.isEmpty else { return }
         // Ignore our own spoken translation coming back through the microphone.
-        if speaker.suppresses(best.0.lang) { return }
-        let t = best.0.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        log.append(Entry(original: t, lang: best.0.lang, translation: nil))
+        if speaker.suppresses(lang) { return }
+        let dbg = String(format: "zh %.2f (%d chars)  en %.2f", zc, han, ec)
+        log.append(Entry(original: lang == "zh" ? zt : et, lang: lang, translation: nil, debug: dbg))
     }
 }
