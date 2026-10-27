@@ -164,6 +164,7 @@ final class Recognizer: ObservableObject {
     lazy var speaker = Speaker(engine: engine)
     private var tapCount = 0
     private var lastLoud: TimeInterval = 0
+    private var floorLevel = 1.0   // background noise level, learned automatically
     private var lastText: TimeInterval = 0
     private var claimed = Set<UUID>()
 
@@ -282,8 +283,12 @@ final class Recognizer: ObservableObject {
                         for i in 0..<n { sum += ch[i] * ch[i] }
                         let rms = (sum / Float(max(n, 1))).squareRoot()
                         let lvl = Double(min(1, max(0, (20 * log10(max(rms, 1e-6)) + 50) / 50)))
-                        if lvl > 0.3 { self.lastLoud = ProcessInfo.processInfo.systemUptime }
-                        if let p, lvl > p.peak { p.peak = lvl }
+                        // Speech = clearly louder than the room's background level.
+                        if lvl < self.floorLevel { self.floorLevel = lvl }
+                        else { self.floorLevel += (lvl - self.floorLevel) * 0.0005 }
+                        let above = lvl - self.floorLevel
+                        if above > 0.12 { self.lastLoud = ProcessInfo.processInfo.systemUptime }
+                        if let p, above > p.peak { p.peak = above }
                         DispatchQueue.main.async {
                             self.bars.removeFirst()
                             self.bars.append(lvl)
@@ -354,7 +359,7 @@ final class Recognizer: ObservableObject {
         let hasText = p.slots.contains { !$0.text.isEmpty }
         // A sentence ends when the room has been quiet for a while (not merely when
         // the recognizer is slow to report words), or when it runs very long.
-        let quiet = now - lastLoud > 1.1 && now - lastText > 0.7
+        let quiet = now - lastLoud > 1.2 && now - lastText > 0.7
         if (hasText && (quiet || age > 12)) || age > 50 { endUtterance(p) }
     }
 
@@ -380,7 +385,7 @@ final class Recognizer: ObservableObject {
         }
         guard !lang.isEmpty else { return }
         // Drop noise, echoes of our own voice, and stray single words.
-        if pair.tainted || pair.peak < 0.4 { return }
+        if pair.tainted || pair.peak < 0.12 { return }
         if lang == "en" && enWords < 2 && et.count < 4 { return }
         // Ignore our own spoken translation coming back through the microphone.
         if speaker.suppresses(lang) { return }
