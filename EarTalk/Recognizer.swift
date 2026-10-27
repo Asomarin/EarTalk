@@ -99,6 +99,19 @@ final class Recognizer: ObservableObject {
     @Published var log: [Entry] = []
     @Published var running = false
     @Published var status = "Stopped"
+    @Published var liveLang = ""
+    @Published var bars: [Double] = Array(repeating: 0.04, count: 32)
+    @Published var speakOn = true
+    @Published var chineseOnLeft = true { didSet { speaker.chineseOnLeft = chineseOnLeft } }
+    lazy var speaker = Speaker(engine: engine)
+    private var tapCount = 0
+    private var claimed = Set<UUID>()
+
+    func claim(_ id: UUID) -> Bool { claimed.insert(id).inserted }
+    func release(_ id: UUID) { claimed.remove(id) }
+    func speak(_ text: String, outLang: String) {
+        if speakOn { speaker.speak(text, outLang: outLang) }
+    }
 
     private let engine = AVAudioEngine()
     private let lock = NSLock()
@@ -156,7 +169,7 @@ final class Recognizer: ObservableObject {
         old?.finish { [weak self] p in self?.decide(p) }
         engine.stop(); engine.inputNode.removeTap(onBus: 0)
         try? AVAudioSession.sharedInstance().setActive(false)
-        live = ""
+        live = ""; liveLang = ""
         status = "Stopped"
     }
 
@@ -179,7 +192,7 @@ final class Recognizer: ObservableObject {
         do {
             let s = AVAudioSession.sharedInstance()
             try s.setCategory(.playAndRecord, mode: .default,
-                              options: [.allowBluetooth, .defaultToSpeaker, .mixWithOthers])
+                              options: [.allowBluetoothA2DP, .defaultToSpeaker, .mixWithOthers])
             try s.setActive(true)
             engine.stop()
             let input = engine.inputNode
@@ -189,6 +202,18 @@ final class Recognizer: ObservableObject {
                 guard let self else { return }
                 self.lock.lock(); let p = self.current; self.lock.unlock()
                 p?.append(buf)
+                self.tapCount &+= 1
+                if self.tapCount % 3 == 0, let ch = buf.floatChannelData?[0] {
+                    let n = Int(buf.frameLength)
+                    var sum: Float = 0
+                    for i in 0..<n { sum += ch[i] * ch[i] }
+                    let rms = (sum / Float(max(n, 1))).squareRoot()
+                    let lvl = Double(min(1, max(0, (20 * log10(max(rms, 1e-6)) + 50) / 50)))
+                    DispatchQueue.main.async {
+                        self.bars.removeFirst()
+                        self.bars.append(lvl)
+                    }
+                }
             }
             engine.prepare()
             try engine.start()
@@ -231,10 +256,11 @@ final class Recognizer: ObservableObject {
         let zh = p.slots.first { $0.lang == "zh" }?.text ?? ""
         let en = p.slots.first { $0.lang == "en" }?.text ?? ""
         live = hasHan(zh) ? zh : en
+        liveLang = hasHan(zh) ? "zh" : (en.isEmpty ? "" : "en")
         silence?.cancel()
         let w = DispatchWorkItem { [weak self, weak p] in self?.endUtterance(p) }
         silence = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.3, execute: w)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: w)
     }
 
     private func endUtterance(_ p: Pair?) {
@@ -249,7 +275,7 @@ final class Recognizer: ObservableObject {
         guard running, let p = peek() else { return }
         let age = Date().timeIntervalSince(p.start)
         let hasText = p.slots.contains { !$0.text.isEmpty }
-        if (age > 25 && hasText) || age > 50 { endUtterance(p) }
+        if (age > 10 && hasText) || age > 50 { endUtterance(p) }
     }
 
     /// Pick the language whose recognizer understood the speech best.
@@ -265,7 +291,9 @@ final class Recognizer: ObservableObject {
         guard let best = cands.max(by: {
             $0.1 < $1.1 || ($0.1 == $1.1 && $0.0.text.count < $1.0.text.count)
         }), best.1 >= 0 else { return }
+        // Ignore our own spoken translation coming back through the microphone.
+        if speaker.suppresses(best.0.lang) { return }
         let t = best.0.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        log.insert(Entry(original: t, lang: best.0.lang, translation: nil), at: 0)
+        log.append(Entry(original: t, lang: best.0.lang, translation: nil))
     }
 }
