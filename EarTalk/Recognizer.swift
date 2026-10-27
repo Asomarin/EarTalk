@@ -13,39 +13,106 @@ private func hasHan(_ s: String) -> Bool {
     s.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }
 }
 
-/// One recognizer (one language) working on the shared audio.
+/// One recognizer (one language). If the system ends its task early (its own
+/// end-of-speech detection, a timeout, an error) it immediately starts a new one
+/// and keeps the text so far, so a sentence is never cut short.
 final class Slot {
     let lang: String
     let offline: Bool
-    let request = SFSpeechAudioBufferRecognitionRequest()
-    var task: SFSpeechRecognitionTask?
-    var text = ""
-    var conf: Float = 0
+    private let recognizer: SFSpeechRecognizer
+    private let reqLock = NSLock()
+    private var request = SFSpeechAudioBufferRecognitionRequest()
+    private var task: SFSpeechRecognitionTask?
+    private var taskActive = false
+    private var gen = 0
+    private var started = Date()
+    private var fails = 0
+    private var committed = ""
+    private var cur = ""
+    private var curConf: Float = 0
+    private var confSum: Float = 0
+    private var confN = 0
+    var finishing = false
     var done = false
     var onActivity: (() -> Void)?
     var onEnded: (() -> Void)?
 
+    var text: String {
+        if committed.isEmpty { return cur }
+        if cur.isEmpty { return committed }
+        return committed + (lang == "en" ? " " : "") + cur
+    }
+    var conf: Float {
+        let n = confN + (cur.isEmpty ? 0 : 1)
+        return n == 0 ? 0 : (confSum + (cur.isEmpty ? 0 : curConf)) / Float(n)
+    }
+
     init?(locale: String, lang: String) {
-        self.lang = lang
         guard let r = SFSpeechRecognizer(locale: Locale(identifier: locale)), r.isAvailable else { return nil }
+        self.lang = lang
+        recognizer = r
         offline = r.supportsOnDeviceRecognition
-        request.shouldReportPartialResults = true
-        request.requiresOnDeviceRecognition = r.supportsOnDeviceRecognition
-        task = r.recognitionTask(with: request) { [weak self] result, error in
-            DispatchQueue.main.async {
-                guard let self, !self.done else { return }
-                if let result {
-                    self.text = result.bestTranscription.formattedString
-                    let segs = result.bestTranscription.segments
-                    self.conf = segs.isEmpty ? 0 : segs.map { $0.confidence }.reduce(0, +) / Float(segs.count)
-                    self.onActivity?()
-                }
-                if error != nil || result?.isFinal == true {
-                    self.done = true
-                    self.onEnded?()
-                }
-            }
+        startTask()
+    }
+
+    func append(_ b: AVAudioPCMBuffer) {
+        reqLock.lock(); let r = request; reqLock.unlock()
+        if !done { r.append(b) }
+    }
+
+    private func startTask() {
+        gen += 1
+        let g = gen
+        let req = SFSpeechAudioBufferRecognitionRequest()
+        req.shouldReportPartialResults = true
+        req.requiresOnDeviceRecognition = offline
+        reqLock.lock(); request = req; reqLock.unlock()
+        started = Date()
+        taskActive = true
+        task = recognizer.recognitionTask(with: req) { [weak self] result, error in
+            DispatchQueue.main.async { self?.handle(g, result, error) }
         }
+    }
+
+    private func handle(_ g: Int, _ result: SFSpeechRecognitionResult?, _ error: Error?) {
+        guard g == gen, !done else { return }
+        if let result {
+            cur = result.bestTranscription.formattedString
+            let segs = result.bestTranscription.segments
+            curConf = segs.isEmpty ? 0 : segs.map { $0.confidence }.reduce(0, +) / Float(segs.count)
+            onActivity?()
+        }
+        guard error != nil || result?.isFinal == true else { return }
+        taskActive = false
+        if !cur.isEmpty {              // bank this task's text
+            committed = text
+            confSum += curConf; confN += 1
+            cur = ""; curConf = 0
+        }
+        if finishing { done = true; onEnded?(); return }
+        let quick = Date().timeIntervalSince(started) < 0.4
+        fails = quick ? fails + 1 : 0
+        let delay = min(Double(fails) * 0.4, 2.0)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, !self.finishing, !self.done else { return }
+            self.startTask()
+        }
+    }
+
+    func finish() {
+        finishing = true
+        if taskActive {
+            reqLock.lock(); let r = request; reqLock.unlock()
+            r.endAudio()
+        } else if !done {
+            done = true
+            onEnded?()
+        }
+    }
+
+    func cancel() {
+        finishing = true; done = true
+        task?.cancel()
     }
 }
 
@@ -53,25 +120,16 @@ final class Slot {
 final class Pair {
     let slots: [Slot]
     let start = Date()
-    var finishing = false
     var onActivity: (() -> Void)?
-    var onDied: (() -> Void)?
 
     init() {
         slots = [Slot(locale: "zh-CN", lang: "zh"), Slot(locale: "en-US", lang: "en")].compactMap { $0 }
-        for s in slots {
-            s.onActivity = { [weak self] in self?.onActivity?() }
-            s.onEnded = { [weak self] in
-                guard let self, !self.finishing else { return }
-                self.onDied?()
-            }
-        }
+        for s in slots { s.onActivity = { [weak self] in self?.onActivity?() } }
     }
 
-    func append(_ b: AVAudioPCMBuffer) { for s in slots { s.request.append(b) } }
+    func append(_ b: AVAudioPCMBuffer) { for s in slots { s.append(b) } }
 
     func finish(_ completion: @escaping (Pair) -> Void) {
-        finishing = true
         var remaining = slots.filter { !$0.done }.count
         var called = false
         let fire = { [self] in
@@ -83,15 +141,12 @@ final class Pair {
                 remaining -= 1
                 if remaining == 0 { fire() }
             }
-            s.request.endAudio()
+            s.finish()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { fire() }
     }
 
-    func cancel() {
-        finishing = true
-        for s in slots { s.task?.cancel(); s.done = true }
-    }
+    func cancel() { for s in slots { s.cancel() } }
 }
 
 final class Recognizer: ObservableObject {
@@ -135,6 +190,12 @@ final class Recognizer: ObservableObject {
                   let v = n.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
                   let reason = AVAudioSession.RouteChangeReason(rawValue: v),
                   reason == .newDeviceAvailable || reason == .oldDeviceUnavailable else { return }
+            self.scheduleRestart()
+        }
+        // iOS stops the engine by itself when the audio route/format changes
+        // (for example when a spoken translation starts playing). Restart it.
+        nc.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+            guard let self, self.running else { return }
             self.scheduleRestart()
         }
         nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
@@ -256,9 +317,6 @@ final class Recognizer: ObservableObject {
     private func makePair() -> Pair {
         let p = Pair()
         p.onActivity = { [weak self, weak p] in self?.activity(p) }
-        p.onDied = { [weak self, weak p] in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self?.endUtterance(p) }
-        }
         if p.slots.isEmpty {
             status = "Speech recognizers unavailable"
         } else {
