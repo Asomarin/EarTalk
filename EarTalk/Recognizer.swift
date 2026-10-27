@@ -105,6 +105,8 @@ final class Recognizer: ObservableObject {
     @Published var chineseOnLeft = true { didSet { speaker.chineseOnLeft = chineseOnLeft } }
     lazy var speaker = Speaker(engine: engine)
     private var tapCount = 0
+    private var lastLoud: TimeInterval = 0
+    private var lastText: TimeInterval = 0
     private var claimed = Set<UUID>()
 
     func claim(_ id: UUID) -> Bool { claimed.insert(id).inserted }
@@ -154,7 +156,7 @@ final class Recognizer: ObservableObject {
                     self.running = true
                     self.restartEngine()
                     self.timer?.invalidate()
-                    self.timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+                    self.timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
                         self?.tick()
                     }
                 }
@@ -216,6 +218,7 @@ final class Recognizer: ObservableObject {
                         for i in 0..<n { sum += ch[i] * ch[i] }
                         let rms = (sum / Float(max(n, 1))).squareRoot()
                         let lvl = Double(min(1, max(0, (20 * log10(max(rms, 1e-6)) + 50) / 50)))
+                        if lvl > 0.3 { self.lastLoud = ProcessInfo.processInfo.systemUptime }
                         DispatchQueue.main.async {
                             self.bars.removeFirst()
                             self.bars.append(lvl)
@@ -270,10 +273,7 @@ final class Recognizer: ObservableObject {
         let en = p.slots.first { $0.lang == "en" }?.text ?? ""
         live = hasHan(zh) ? zh : en
         liveLang = hasHan(zh) ? "zh" : (en.isEmpty ? "" : "en")
-        silence?.cancel()
-        let w = DispatchWorkItem { [weak self, weak p] in self?.endUtterance(p) }
-        silence = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: w)
+        lastText = ProcessInfo.processInfo.systemUptime
     }
 
     private func endUtterance(_ p: Pair?) {
@@ -286,9 +286,13 @@ final class Recognizer: ObservableObject {
 
     private func tick() {
         guard running, let p = peek() else { return }
+        let now = ProcessInfo.processInfo.systemUptime
         let age = Date().timeIntervalSince(p.start)
         let hasText = p.slots.contains { !$0.text.isEmpty }
-        if (age > 10 && hasText) || age > 50 { endUtterance(p) }
+        // A sentence ends when the room has been quiet for a while (not merely when
+        // the recognizer is slow to report words), or when it runs very long.
+        let quiet = now - lastLoud > 1.1 && now - lastText > 0.7
+        if (hasText && (quiet || age > 12)) || age > 50 { endUtterance(p) }
     }
 
     /// Pick the language whose recognizer understood the speech best.
