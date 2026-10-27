@@ -14,6 +14,16 @@ final class Recognizer: ObservableObject {
     private var task: SFSpeechRecognitionTask?
     private var gen = 0
     private var timer: Timer?
+    private var pendingRestart: DispatchWorkItem?
+
+    private func scheduleRestart() {
+        pendingRestart?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            if self?.running == true { self?.restartEngine() }
+        }
+        pendingRestart = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: w)
+    }
 
     init() {
         let nc = NotificationCenter.default
@@ -21,15 +31,20 @@ final class Recognizer: ObservableObject {
             guard let self, self.running,
                   let v = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                   AVAudioSession.InterruptionType(rawValue: v) == .ended else { return }
-            self.restartEngine()
+            self.scheduleRestart()
         }
-        nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            guard let self, self.running else { return }
-            self.restartEngine()
+        nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] n in
+            // Only react to real plug/unplug events. Reacting to every route change
+            // (including ones our own restart causes) creates an endless restart loop.
+            guard let self, self.running,
+                  let v = n.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                  let reason = AVAudioSession.RouteChangeReason(rawValue: v),
+                  reason == .newDeviceAvailable || reason == .oldDeviceUnavailable else { return }
+            self.scheduleRestart()
         }
         nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self, self.running else { return }
-            self.restartEngine()
+            self.scheduleRestart()
         }
     }
 
@@ -55,6 +70,7 @@ final class Recognizer: ObservableObject {
 
     func stop() {
         running = false
+        pendingRestart?.cancel()
         timer?.invalidate()
         commit()
         task?.cancel(); request?.endAudio()
