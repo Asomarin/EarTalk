@@ -30,6 +30,18 @@ final class Speaker {
         return Date() < (busyUntil[lang] ?? .distantPast).addingTimeInterval(1.2)
     }
 
+    /// On the phone speaker our own voice reaches the microphone, so everything heard
+    /// while (and just after) a translation plays is ignored. Earbuds don't need this.
+    func muteAll() -> Bool {
+        let onSpeaker = AVAudioSession.sharedInstance().currentRoute.outputs.contains {
+            $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver
+        }
+        guard onSpeaker else { return false }
+        lock.lock(); defer { lock.unlock() }
+        let now = Date()
+        return busyUntil.values.contains { now < $0.addingTimeInterval(1.2) }
+    }
+
     /// `outLang` is the language of the translation, i.e. what the listener understands.
     func speak(_ text: String, outLang: String) {
         queue.append((text, outLang))
