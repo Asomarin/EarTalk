@@ -107,6 +107,7 @@ struct ContentView: View {
                 Text(isZh ? "中文" : "ENGLISH").font(.caption2.bold()).foregroundStyle(c)
                 Text(e.original).font(.footnote).foregroundStyle(.white.opacity(0.65))
                 Text(e.translation ?? "Translating…").font(.body.weight(.semibold))
+                Text(e.debug).font(.caption2).foregroundStyle(.white.opacity(0.3))
             }
             .padding(12)
             .background(RoundedRectangle(cornerRadius: 16).fill(c.opacity(0.16)))
