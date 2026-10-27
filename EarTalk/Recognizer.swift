@@ -189,39 +189,52 @@ final class Recognizer: ObservableObject {
     }
 
     private func restartEngine() {
-        do {
-            let s = AVAudioSession.sharedInstance()
-            try s.setCategory(.playAndRecord, mode: .default,
-                              options: [.allowBluetoothA2DP, .defaultToSpeaker, .mixWithOthers])
-            try s.setActive(true)
-            engine.stop()
-            let input = engine.inputNode
-            input.removeTap(onBus: 0)
-            let fmt = input.outputFormat(forBus: 0)
-            input.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buf, _ in
-                guard let self else { return }
-                self.lock.lock(); let p = self.current; self.lock.unlock()
-                p?.append(buf)
-                self.tapCount &+= 1
-                if self.tapCount % 3 == 0, let ch = buf.floatChannelData?[0] {
-                    let n = Int(buf.frameLength)
-                    var sum: Float = 0
-                    for i in 0..<n { sum += ch[i] * ch[i] }
-                    let rms = (sum / Float(max(n, 1))).squareRoot()
-                    let lvl = Double(min(1, max(0, (20 * log10(max(rms, 1e-6)) + 50) / 50)))
-                    DispatchQueue.main.async {
-                        self.bars.removeFirst()
-                        self.bars.append(lvl)
+        // Try the best audio setup first, then simpler ones if the engine refuses to start.
+        let attempts: [AVAudioSession.CategoryOptions] = [
+            [.allowBluetoothA2DP, .defaultToSpeaker, .mixWithOthers],
+            [.defaultToSpeaker, .mixWithOthers],
+            [.allowBluetooth, .defaultToSpeaker, .mixWithOthers]
+        ]
+        var lastError: Error?
+        for opts in attempts {
+            do {
+                let s = AVAudioSession.sharedInstance()
+                try s.setCategory(.playAndRecord, mode: .default, options: opts)
+                try s.setActive(true)
+                engine.stop()
+                _ = speaker   // attach the playback nodes before the engine starts
+                let input = engine.inputNode
+                input.removeTap(onBus: 0)
+                input.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buf, _ in
+                    guard let self else { return }
+                    self.lock.lock(); let p = self.current; self.lock.unlock()
+                    p?.append(buf)
+                    self.tapCount &+= 1
+                    if self.tapCount % 3 == 0, let ch = buf.floatChannelData?[0] {
+                        let n = Int(buf.frameLength)
+                        var sum: Float = 0
+                        for i in 0..<n { sum += ch[i] * ch[i] }
+                        let rms = (sum / Float(max(n, 1))).squareRoot()
+                        let lvl = Double(min(1, max(0, (20 * log10(max(rms, 1e-6)) + 50) / 50)))
+                        DispatchQueue.main.async {
+                            self.bars.removeFirst()
+                            self.bars.append(lvl)
+                        }
                     }
                 }
+                engine.prepare()
+                try engine.start()
+                let old = swapCurrent(makePair())
+                old?.finish { [weak self] p in self?.decide(p) }
+                return
+            } catch {
+                lastError = error
+                engine.inputNode.removeTap(onBus: 0)
             }
-            engine.prepare()
-            try engine.start()
-            let old = swapCurrent(makePair())
-            old?.finish { [weak self] p in self?.decide(p) }
-        } catch {
-            status = "Audio error: \(error.localizedDescription)"
-            scheduleRestart()
+        }
+        status = "Audio error: \(lastError?.localizedDescription ?? "unknown")"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            if self?.running == true { self?.restartEngine() }
         }
     }
 
